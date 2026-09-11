@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import csv
 import os
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, date, time as dtime, timezone
 from zoneinfo import ZoneInfo
 
@@ -257,6 +258,99 @@ def make_chart(df, title):
     return fig
 
 
+# ═══════════════ MARKET-MOVING NEWS FILTER ═══════════════
+# RSS feeds — geopolitics + financial. Bloomberg ka koi free API
+# nahi hai (terminal-only), isliye Al Jazeera + maali sources.
+
+FEEDS = {
+    "Al Jazeera":  "https://www.aljazeera.com/xml/rss/all.xml",
+    "Investing":   "https://www.investing.com/rss/news_285.rss",
+    "FXStreet":    "https://www.fxstreet.com/rss/news",
+    "CoinDesk":    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "Yahoo Fin":   "https://finance.yahoo.com/news/rssindex",
+}
+
+# weight: kitna asar daal sakti hai
+KW_HIGH = {"fed": 3, "fomc": 3, "rate cut": 3, "rate hike": 3, "interest rate": 3,
+           "inflation": 3, "cpi": 3, "nonfarm": 3, "payroll": 3, "powell": 3,
+           "war": 3, "strike": 2, "sanction": 3, "tariff": 3, "escalat": 2,
+           "conflict": 2, "attack": 2, "ceasefire": 2, "invasion": 3}
+KW_GOLD = {"gold": 3, "xau": 3, "bullion": 3, "safe haven": 2, "dollar": 2,
+           "treasury": 2, "yield": 2, "central bank": 2, "recession": 2,
+           "middle east": 2, "israel": 2, "iran": 2, "russia": 2, "ukraine": 2,
+           "china": 1, "opec": 1, "oil": 1}
+KW_BTC = {"bitcoin": 3, "btc": 3, "crypto": 2, "ethereum": 1, "etf": 2,
+          "sec ": 2, "halving": 2, "miner": 1, "stablecoin": 2,
+          "coinbase": 2, "binance": 2, "blockchain": 1}
+
+
+def _score(title: str, table: dict) -> int:
+    t = title.lower()
+    return sum(w for k, w in table.items() if k in t)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_market_news(limit: int = 12) -> tuple[list[dict], list[str], list[str]]:
+    """(relevant_items, working_sources, failed_sources)"""
+    items, ok, bad = [], [], []
+    for name, url in FEEDS.items():
+        try:
+            r = requests.get(url, timeout=8, headers={
+                "User-Agent": "Mozilla/5.0 (compatible; TradingTerminal/1.0)"})
+            r.raise_for_status()
+            root = ET.fromstring(r.content)
+            n = 0
+            for it in root.findall(".//item")[:25]:
+                title = (it.findtext("title") or "").strip()
+                if not title:
+                    continue
+                link = (it.findtext("link") or "").strip()
+                pub = (it.findtext("pubDate") or "").strip()
+                base = _score(title, KW_HIGH)
+                g = _score(title, KW_GOLD) + base
+                b = _score(title, KW_BTC) + base
+                if max(g, b) < 3:
+                    continue                    # market ke liye bemani
+                items.append(dict(title=title[:130], link=link, src=name,
+                                  pub=pub, gold=g, btc=b, hi=base))
+                n += 1
+            ok.append(f"{name} ({n})")
+        except (requests.RequestException, ET.ParseError, ValueError):
+            bad.append(name)
+    items.sort(key=lambda x: max(x["gold"], x["btc"]), reverse=True)
+    return items[:limit], ok, bad
+
+
+def render_market_news() -> None:
+    st.subheader("Market-Moving News")
+    items, ok, bad = fetch_market_news()
+    st.caption("Headlines keywords se filter hoti hain · "
+               "ye batati hai KYA hua, ye nahi ke price kidhar jayegi")
+
+    if not items:
+        st.info("Is waqt koi market-relevant headline nahi mili.")
+    for it in items:
+        tags = []
+        if it["gold"] >= 3:
+            tags.append("GOLD")
+        if it["btc"] >= 3:
+            tags.append("BTC")
+        strength = max(it["gold"], it["btc"])
+        badge = "🔴" if strength >= 7 else ("🟠" if strength >= 5 else "🟡")
+        title = f"[{it['title']}]({it['link']})" if it["link"] else f"**{it['title']}**"
+        st.markdown(
+            f"{badge} `{' + '.join(tags) or 'MACRO'}` {title}  \n"
+            f"<span class='muted'>{it['src']} · impact {strength}"
+            + (f" · {it['pub'][:22]}" if it["pub"] else "") + "</span>",
+            unsafe_allow_html=True)
+
+    with st.expander("News sources", expanded=False):
+        st.caption("Working: " + (", ".join(ok) if ok else "koi nahi"))
+        if bad:
+            st.caption("Not reachable: " + ", ".join(bad))
+        st.caption("Bloomberg ka free API maujood nahi (terminal-only).")
+
+
 # ═══════════════ SIGNAL LOG + SELF-SCORING ═══════════════
 # Dashboard ka sabse ahem hissa: apna record khud rakhta hai.
 # Signal tabhi log hota hai jab wo BADALTA hai (har 60s nahi).
@@ -458,9 +552,12 @@ def render():
                      use_container_width=True)
 
     st.divider()
+    render_market_news()
+
+    st.divider()
 
     # ── News ──
-    st.subheader("Latest News")
+    st.subheader("Symbol News")
     for tab, (name, sym) in zip(st.tabs(list(SYMBOLS.keys())), SYMBOLS.items()):
         with tab:
             items = get_news(sym)
